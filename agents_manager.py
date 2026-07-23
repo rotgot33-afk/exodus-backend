@@ -1,7 +1,7 @@
 """
 EXODUS-style Agents Manager
 إدارة الوكلاء باستخدام Groq (Llama-3.3-70B) للجميع
-يدعم: Supabase (عند توفره) أو SQLite (fallback)
+يدعم: Supabase عبر REST API (httpx) أو SQLite (fallback)
 """
 
 import os
@@ -12,11 +12,11 @@ import asyncio
 import sqlite3
 from typing import Optional, List, Dict, Any
 
-# ============== Groq Client ==============
-
+import httpx
 from groq import AsyncGroq
 
-# Initialize Groq client - try multiple sources
+# ============== Groq Client ==============
+
 GROQ_API_KEY = (
     os.environ.get("GROQ_API_KEY") or
     os.environ.get("groq_api_key") or
@@ -24,48 +24,70 @@ GROQ_API_KEY = (
     ""
 )
 
-# Debug info
 print(f"DEBUG: GROQ_API_KEY set: {bool(GROQ_API_KEY)}", flush=True)
-print(f"DEBUG: Env vars with GROQ: {[k for k in os.environ if 'GROQ' in k.upper()]}", flush=True)
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-# Default model (all agents use the same model)
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 
-# ============== Supabase Client ==============
+# ============== Supabase via REST API ==============
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", os.environ.get("SUPABASE_ANON_KEY", ""))
-supabase = None
-supabase_enabled = False
+supabase_enabled = bool(SUPABASE_URL and SUPABASE_KEY)
 
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
-        from supabase import create_client, Client
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        supabase_enabled = True
-        print(f"✅ Supabase enabled: {SUPABASE_URL}", flush=True)
-    else:
-        print("⚠️ Supabase not configured (SUPABASE_URL or SUPABASE_KEY missing)", flush=True)
-except Exception as e:
-    print(f"❌ Supabase init failed: {e}", flush=True)
-    supabase_enabled = False
+print(f"DEBUG: Supabase enabled: {supabase_enabled} ({SUPABASE_URL})", flush=True)
 
 
 def init_supabase():
     """Re-check Supabase (called on startup)"""
-    global supabase, supabase_enabled
+    global supabase_enabled
+    supabase_enabled = bool(SUPABASE_URL and SUPABASE_KEY)
+    print(f"Supabase status: {'enabled' if supabase_enabled else 'disabled (using SQLite fallback)'}", flush=True)
+
+
+async def supabase_request(method: str, table: str, data: dict = None, filters: dict = None, order: str = None) -> Optional[Any]:
+    """Make a request to Supabase REST API"""
     if not supabase_enabled:
-        try:
-            if SUPABASE_URL and SUPABASE_KEY:
-                from supabase import create_client, Client
-                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-                supabase_enabled = True
-                print(f"✅ Supabase re-initialized: {SUPABASE_URL}", flush=True)
-        except Exception as e:
-            print(f"❌ Supabase re-init failed: {e}", flush=True)
+        return None
+
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    # Add filters as query params
+    params = {}
+    if filters:
+        for k, v in filters.items():
+            params[k] = f"eq.{v}"
+    if order:
+        params["order"] = order
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            if method == "GET":
+                resp = await client.get(url, headers=headers, params=params)
+            elif method == "POST":
+                resp = await client.post(url, headers=headers, params=params, json=data)
+            elif method == "PATCH":
+                resp = await client.patch(url, headers=headers, params=params, json=data)
+            elif method == "DELETE":
+                resp = await client.delete(url, headers=headers, params=params)
+            else:
+                return None
+
+            if resp.status_code in (200, 201):
+                return resp.json() if resp.text else []
+            else:
+                print(f"Supabase {method} {table} failed: {resp.status_code} {resp.text[:200]}", flush=True)
+                return None
+    except Exception as e:
+        print(f"Supabase request error: {e}", flush=True)
+        return None
 
 
 # ============== SQLite Fallback ==============
@@ -74,7 +96,6 @@ DB_PATH = "/tmp/exodus_agents.db"
 
 
 def init_db():
-    """Initialize SQLite database (fallback when Supabase not available)"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -94,8 +115,6 @@ def init_db():
 
 init_db()
 
-
-# Default agents
 DEFAULT_AGENTS = [
     {
         "name": "Recon Specialist",
@@ -122,23 +141,20 @@ DEFAULT_AGENTS = [
 
 def seed_default_agents():
     """Create default agents if database is empty"""
-    if supabase_enabled:
-        try:
-            # Check if agents exist
-            result = supabase.table("agents").select("id").limit(1).execute()
-            if not result.data:
-                # Insert defaults
+    async def _seed():
+        if supabase_enabled:
+            result = await supabase_request("GET", "agents", filters={"id": "not.is.null"}, order="created_at.desc")
+            if result is not None and len(result) == 0:
                 for agent in DEFAULT_AGENTS:
-                    supabase.table("agents").insert({
+                    await supabase_request("POST", "agents", data={
                         "name": agent["name"],
                         "specialty": agent["specialty"],
                         "system_prompt": agent["system_prompt"],
                         "model": DEFAULT_MODEL,
-                    }).execute()
+                    })
                 print("✅ Default agents seeded to Supabase", flush=True)
-        except Exception as e:
-            print(f"⚠️ Supabase seed failed: {e}", flush=True)
-    else:
+            return
+
         # SQLite fallback
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -155,22 +171,20 @@ def seed_default_agents():
             conn.commit()
         conn.close()
 
-
-# Run seed on import
-seed_default_agents()
+    try:
+        asyncio.get_event_loop().run_until_complete(_seed())
+    except RuntimeError:
+        # No event loop yet, create one
+        asyncio.run(_seed())
 
 
 # ============== Agent CRUD ==============
 
-def list_agents() -> List[Dict[str, Any]]:
-    """List all agents"""
+async def list_agents() -> List[Dict[str, Any]]:
     if supabase_enabled:
-        try:
-            result = supabase.table("agents").select("*").order("created_at", desc=True).execute()
-            return result.data or []
-        except Exception as e:
-            print(f"Supabase list_agents failed: {e}", flush=True)
-            return _sqlite_list_agents()
+        result = await supabase_request("GET", "agents", order="created_at.desc")
+        if result is not None:
+            return result
     return _sqlite_list_agents()
 
 
@@ -190,15 +204,11 @@ def _sqlite_list_agents() -> List[Dict[str, Any]]:
     ]
 
 
-def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
-    """Get a single agent"""
+async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
     if supabase_enabled:
-        try:
-            result = supabase.table("agents").select("*").eq("id", agent_id).execute()
-            return result.data[0] if result.data else None
-        except Exception as e:
-            print(f"Supabase get_agent failed: {e}", flush=True)
-            return _sqlite_get_agent(agent_id)
+        result = await supabase_request("GET", "agents", filters={"id": agent_id})
+        if result is not None:
+            return result[0] if result else None
     return _sqlite_get_agent(agent_id)
 
 
@@ -217,24 +227,18 @@ def _sqlite_get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def create_agent(name: str, specialty: str, system_prompt: str, model: str = DEFAULT_MODEL) -> Dict[str, Any]:
-    """Create a new agent"""
+async def create_agent(name: str, specialty: str, system_prompt: str, model: str = DEFAULT_MODEL) -> Dict[str, Any]:
     if supabase_enabled:
-        try:
-            result = supabase.table("agents").insert({
-                "name": name,
-                "specialty": specialty,
-                "system_prompt": system_prompt,
-                "model": model,
-            }).execute()
-            return result.data[0] if result.data else {}
-        except Exception as e:
-            print(f"Supabase create_agent failed: {e}", flush=True)
-            return _sqlite_create_agent(name, specialty, system_prompt, model)
+        result = await supabase_request("POST", "agents", data={
+            "name": name, "specialty": specialty,
+            "system_prompt": system_prompt, "model": model,
+        })
+        if result is not None:
+            return result[0] if result else {}
     return _sqlite_create_agent(name, specialty, system_prompt, model)
 
 
-def _sqlite_create_agent(name: str, specialty: str, system_prompt: str, model: str) -> Dict[str, Any]:
+def _sqlite_create_agent(name, specialty, system_prompt, model):
     agent_id = str(uuid.uuid4())
     now = time.time()
     conn = sqlite3.connect(DB_PATH)
@@ -248,9 +252,8 @@ def _sqlite_create_agent(name: str, specialty: str, system_prompt: str, model: s
     return _sqlite_get_agent(agent_id)
 
 
-def update_agent(agent_id: str, name: str = None, specialty: str = None, system_prompt: str = None, model: str = None) -> Optional[Dict[str, Any]]:
-    """Update an agent"""
-    agent = get_agent(agent_id)
+async def update_agent(agent_id: str, name: str = None, specialty: str = None, system_prompt: str = None, model: str = None) -> Optional[Dict[str, Any]]:
+    agent = await get_agent(agent_id)
     if not agent:
         return None
 
@@ -261,46 +264,28 @@ def update_agent(agent_id: str, name: str = None, specialty: str = None, system_
     if model is not None: updates["model"] = model
 
     if supabase_enabled:
-        try:
-            result = supabase.table("agents").update(updates).eq("id", agent_id).execute()
-            return result.data[0] if result.data else None
-        except Exception as e:
-            print(f"Supabase update_agent failed: {e}", flush=True)
-            return _sqlite_update_agent(agent_id, agent, name, specialty, system_prompt, model)
-    return _sqlite_update_agent(agent_id, agent, name, specialty, system_prompt, model)
+        result = await supabase_request("PATCH", "agents", data=updates, filters={"id": agent_id})
+        if result is not None:
+            return result[0] if result else None
 
-
-def _sqlite_update_agent(agent_id, agent, name, specialty, system_prompt, model):
+    # SQLite fallback
     now = time.time()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        """UPDATE agents SET 
-           name = ?, specialty = ?, system_prompt = ?, model = ?, updated_at = ? 
-           WHERE id = ?""",
-        (
-            name or agent["name"],
-            specialty or agent["specialty"],
-            system_prompt or agent["system_prompt"],
-            model or agent["model"],
-            now,
-            agent_id
-        )
+        """UPDATE agents SET name = ?, specialty = ?, system_prompt = ?, model = ?, updated_at = ? WHERE id = ?""",
+        (name or agent["name"], specialty or agent["specialty"],
+         system_prompt or agent["system_prompt"], model or agent["model"], now, agent_id)
     )
     conn.commit()
     conn.close()
     return _sqlite_get_agent(agent_id)
 
 
-def delete_agent(agent_id: str):
-    """Delete an agent"""
+async def delete_agent(agent_id: str):
     if supabase_enabled:
-        try:
-            supabase.table("agents").delete().eq("id", agent_id).execute()
-            return
-        except Exception as e:
-            print(f"Supabase delete_agent failed: {e}", flush=True)
-
+        await supabase_request("DELETE", "agents", filters={"id": agent_id})
+        return
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
@@ -308,18 +293,16 @@ def delete_agent(agent_id: str):
     conn.close()
 
 
-# ============== Chat with Agent ==============
+# ============== Chat ==============
 
 async def chat_with_agent(agent_id: str, messages: list, stream: bool = True):
-    """Stream chat with an agent using Groq"""
-    agent = get_agent(agent_id)
+    agent = await get_agent(agent_id)
     if not agent:
         raise ValueError("Agent not found")
 
     if not groq_client:
         raise RuntimeError("GROQ_API_KEY not set")
 
-    # Build messages with agent's system prompt
     full_messages = [{"role": "system", "content": agent["system_prompt"]}]
     full_messages.extend(messages)
 
@@ -344,11 +327,8 @@ async def chat_with_agent(agent_id: str, messages: list, stream: bool = True):
         yield resp.choices[0].message.content
 
 
-# ============== Generate Kali Command ==============
-
 async def generate_kali_command(agent_id: str, user_request: str):
-    """Generate a Kali Linux command based on user request"""
-    agent = get_agent(agent_id)
+    agent = await get_agent(agent_id)
     if not agent:
         raise ValueError("Agent not found")
 
@@ -395,3 +375,25 @@ async def generate_kali_command(agent_id: str, user_request: str):
         "warning": "",
         "safe_to_run": True
     }
+
+
+# ============== Sync wrappers for FastAPI ==============
+
+def list_agents_sync() -> List[Dict[str, Any]]:
+    """Sync wrapper for list_agents"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're in an async context, can't use run_until_complete
+            # Use SQLite fallback for sync call
+            return _sqlite_list_agents()
+        return loop.run_until_complete(list_agents())
+    except RuntimeError:
+        return asyncio.run(list_agents())
+
+
+# Initialize on import
+try:
+    seed_default_agents()
+except Exception as e:
+    print(f"Seed agents warning: {e}", flush=True)

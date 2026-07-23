@@ -119,12 +119,12 @@ async def health():
 @app.get("/api/agents")
 async def api_list_agents():
     """List all agents"""
-    return {"agents": list_agents()}
+    return {"agents": await list_agents()}
 
 
 @app.get("/api/agents/{agent_id}")
 async def api_get_agent(agent_id: str):
-    agent = get_agent(agent_id)
+    agent = await get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
@@ -132,7 +132,7 @@ async def api_get_agent(agent_id: str):
 
 @app.post("/api/agents")
 async def api_create_agent(agent: AgentCreate):
-    return create_agent(
+    return await create_agent(
         name=agent.name,
         specialty=agent.specialty,
         system_prompt=agent.system_prompt,
@@ -142,7 +142,7 @@ async def api_create_agent(agent: AgentCreate):
 
 @app.put("/api/agents/{agent_id}")
 async def api_update_agent(agent_id: str, agent: AgentUpdate):
-    updated = update_agent(
+    updated = await update_agent(
         agent_id,
         name=agent.name,
         specialty=agent.specialty,
@@ -156,7 +156,7 @@ async def api_update_agent(agent_id: str, agent: AgentUpdate):
 
 @app.delete("/api/agents/{agent_id}")
 async def api_delete_agent(agent_id: str):
-    delete_agent(agent_id)
+    await delete_agent(agent_id)
     return {"deleted": True}
 
 
@@ -165,7 +165,7 @@ async def api_delete_agent(agent_id: str):
 @app.post("/api/agents/{agent_id}/chat")
 async def api_chat(agent_id: str, req: ChatRequest):
     """Chat with an agent (streaming SSE)"""
-    agent = get_agent(agent_id)
+    agent = await get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
@@ -211,7 +211,7 @@ async def api_execute(req: ExecuteRequest):
 
     # Optional: verify agent_id exists
     if req.agent_id:
-        agent = get_agent(req.agent_id)
+        agent = await get_agent(req.agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
 
