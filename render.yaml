@@ -1,0 +1,22 @@
+# Render configuration
+services:
+  - type: web
+    name: exodus-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PORT
+        value: 8000
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      # Note: Render free tier doesn't include persistent disk
+      # Data will be lost on restart - we use in-memory + SQLite on /tmp
+      name: tmp-data
+      mountPath: /tmp
+      sizeGB: 1 # optional, free tier may not include this
